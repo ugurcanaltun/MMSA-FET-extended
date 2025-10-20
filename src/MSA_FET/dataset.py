@@ -347,7 +347,7 @@ def run_dataset(
     log_listener.start()
     logger = init_log_worker(log_q, "FET-Dataset")
 
-    if type(config) == str:
+    if isinstance(config, str):
         if Path(config).is_file():
             with open(config, 'r') as f:
                 config = json.load(f)
@@ -356,25 +356,59 @@ def run_dataset(
                 config = json.load(f)
         else:
             raise ValueError(f"Config file {config} does not exist.")
-    elif type(config) == dict:
-        pass
-    else:
+    elif not isinstance(config, dict):
         raise ValueError("Invalid argument type for `config`.")
-
+    
+    # Define pool here to access it in the except block
+    pool = None
+    
     try:
         label_df, dataset_dir, dataset_name, dataset_config = \
             read_label_file(dataset_name, dataset_root_dir, dataset_dir)
-        error_df = pd.DataFrame()
         
         logger.info(f"Extracting features from '{dataset_name}' dataset.")
         logger.info(f"Dataset directory: '{dataset_dir}'")
 
+        # Split the DataFrame by mode ('train', 'valid', 'test') before processing
+        modes = ['train', 'valid', 'test']
+        df_splits = {mode: label_df[label_df['mode'] == mode].copy() for mode in modes}
+
         report = None
-        if type(progress_q) == Queue and task_id is not None:
-            report = {'task_id': task_id, 'msg': 'Preparing', 'processed': 0, 'total': 0}
+        if isinstance(progress_q, Queue) and task_id is not None:
+            report = {'task_id': task_id, 'msg': 'Preparing', 'processed': 0, 'total': len(label_df)}
             progress_q.put(report)
 
-        data = {
+        extractors = {
+            "audio": AUDIO_EXTRACTOR_MAP[config['audio']['tool']] if config.get('audio') else None,
+            "video": VIDEO_EXTRACTOR_MAP[config['video']['tool']] if config.get('video') else None,
+            "text": TEXT_EXTRACTOR_MAP[config['text']['model']] if config.get('text') else None,
+            "align": Aligner[config['align']['tool']] if config.get('align') else None
+        }
+        init_args = (extractors, config, log_q, tmp_dir, dataset_dir)
+        
+        final_data = {}
+        total_error_df = pd.DataFrame()
+        global_processed_count = 0
+        
+        logger.info(f"Extracting features from '{dataset_name}' dataset.")
+        logger.info(f"Dataset directory: '{dataset_dir}'")
+
+        # Process each split sequentially to save memory
+        for mode, df_split in df_splits.items():
+            if len(df_split) == 0:
+                logger.info(f"Skipping empty split: '{mode}'")
+                continue
+            
+            logger.info(f"Processing '{mode}' split with {len(df_split)} samples...")
+            
+            pool = mp_ctx.Pool(
+                processes=num_workers,
+                initializer=init_pool,
+                initargs=init_args
+            )
+
+            # This dictionary holds data for the current split only
+            data_split = {
             "id": [], 
             "audio": [],
             "vision": [],
@@ -391,111 +425,107 @@ def run_dataset(
             'regression_labels_T': [],
             'align': [],
             "mode": []
-        }
-
-        extractors = {
-            "audio": AUDIO_EXTRACTOR_MAP[config['audio']['tool']] if config.get('audio') else None,
-            "video": VIDEO_EXTRACTOR_MAP[config['video']['tool']] if config.get('video') else None,
-            "text": TEXT_EXTRACTOR_MAP[config['text']['model']] if config.get('text') else None,
-            "align": Aligner[config['align']['tool']] if config.get('align') else None
-        }
-
-        pool = mp_ctx.Pool(
-            processes = num_workers,
-            initializer=init_pool,
-            initargs=(extractors, config, log_q, tmp_dir, dataset_dir)
-        )
-
-        if report is not None:
-            report['msg'] = 'Processing'
-            report['total'] = len(label_df)
-            progress_q.put(report)
-        
-        for result in (pbar := tqdm(pool.imap_unordered(extract_one, label_df.iterrows(), chunksize=5), total=len(label_df))):
-            if type(result) is pd.Series:
-                error_df = pd.concat([error_df, result.to_frame().T])
-                continue
-            for k, v in result.items():
-                data[k].append(v)
+            }
+            error_df_split = pd.DataFrame()
+            
             if report is not None:
-                report['processed'] = pbar.n
+                report['msg'] = f'Processing {mode} split'
                 progress_q.put(report)
-        
-        pool.close()
-        pool.join()
 
+            pbar_desc = f"Processing '{mode}' split"
+            for result in (pbar := tqdm(pool.imap_unordered(extract_one, df_split.iterrows(), chunksize=5), total=len(df_split), desc=pbar_desc)):
+                if isinstance(result, pd.Series):
+                    error_df_split = pd.concat([error_df_split, result.to_frame().T])
+                    continue
+                for k, v in result.items():
+                    data_split[k].append(v)
+                if report is not None:
+                    report['processed'] = global_processed_count + pbar.n
+                    progress_q.put(report)
+            
+            pool.close()
+            pool.join()
+            global_processed_count += len(df_split)
+            total_error_df = pd.concat([total_error_df, error_df_split])
+
+            # Perform the "finalizing" steps on this split's data
+            logger.info(f"Finalizing '{mode}' split...")
+
+            # remove unimodal labels if not exist
+            for key in ['regression_labels_A', 'regression_labels_V', 'regression_labels_T']:
+                if np.isnan(np.sum(data_split[key])):
+                    data_split.pop(key)
+            # remove empty features
+            for key in ['audio', 'vision', 'text', 'text_bert', 'audio_lengths', 'vision_lengths']:
+                if len(data_split[key]) == 0:
+                    data_split.pop(key)
+            # remove lengths for aligned feature 
+            if config.get('align'):
+                data_split.pop("vision_lengths", None)
+                data_split.pop("audio_lengths", None)
+            else:
+                data_split.pop("align")
+            
+            # Padding features for the split
+            for item in ['audio', 'vision', 'text', 'text_bert']:
+                if item in data_split:
+                    data_split[item], final_length = paddingSequence(data_split[item], padding_value, padding_location)
+                    if f"{item}_lengths" in data_split:
+                        for i, length in enumerate(data_split[f"{item}_lengths"]):
+                            if length > final_length:
+                                data_split[f"{item}_lengths"][i] = final_length
+            
+            # transpose text_bert
+            if 'text_bert' in data_split:
+                data_split['text_bert'] = data_split['text_bert'].transpose(0, 2, 1)
+            
+            data_split.pop('mode', None)
+
+            # Convert lists to numpy arrays
+            for key, value in data_split.items():
+                if isinstance(value, list):
+                    try:
+                        data_split[key] = np.array(value)
+                    except ValueError:
+                        data_split[key] = np.array(value, dtype=object)
+
+            final_data[mode] = data_split
+            del data_split # Explicitly free memory
+
+        # Combine results into the final structure
+        data = final_data
+        data['config'] = config
+        
         if report is not None:
             report['msg'] = 'Finalizing'
             progress_q.put(report)
-        
-        # remove unimodal labels if not exist
-        for key in ['regression_labels_A', 'regression_labels_V', 'regression_labels_T']:
-            if np.isnan(np.sum(data[key])):
-                data.pop(key)
-        # remove empty features
-        for key in ['audio', 'vision', 'text', 'text_bert', 'audio_lengths', 'vision_lengths']:
-            if len(data[key]) == 0:
-                data.pop(key)
-        # remove lengths for aligned feature
-        if config.get('align'):
-            data.pop("vision_lengths")
-            data.pop("audio_lengths")
-        else:
-            data.pop("align")
-        # padding features
-        for item in ['audio', 'vision', 'text', 'text_bert']:
-            if item in data:
-                data[item], final_length = paddingSequence(data[item], padding_value, padding_location)
-                if f"{item}_lengths" in data:
-                    for i, length in enumerate(data[f"{item}_lengths"]):
-                        if length > final_length:
-                            data[f"{item}_lengths"][i] = final_length
-        # transpose text_bert
-        if 'text_bert' in data:
-            data['text_bert'] = data['text_bert'].transpose(0, 2, 1)
-        # repack features
-        idx_dict = {
-            mode + '_index': [i for i, v in enumerate(data['mode']) if v == mode]
-            for mode in ['train', 'valid', 'test']
-        }
-        data.pop('mode')
-        final_data = {k: {} for k in ['train', 'valid', 'test']}
-        for mode in ['train', 'valid', 'test']:
-            indexes = idx_dict[mode + '_index']
-            for item in data.keys():
-                if isinstance(data[item], list):
-                    final_data[mode][item] = np.array([data[item][v] for v in indexes])
-                else:
-                    final_data[mode][item] = data[item][indexes]
-        data = final_data
-        data['config'] = config
-        # convert labels to numpy array
 
-        # convert to pytorch tensors
         if return_type == 'pt':
-            for mode in data.keys():
-                if mode == 'config':
+            for mode in data:
+                if mode == 'config': 
                     continue
                 for key in ['audio', 'vision', 'text', 'text_bert']:
                     if key in data[mode]:
                         data[mode][key] = torch.from_numpy(data[mode][key])
-        # save result
-        if out_file is None:
-            out_file = dataset_dir / 'feature.pkl'
-        else:
-            out_file = Path(out_file)
+        
+        # save result 
+        out_file = Path(dataset_dir / 'feature.pkl' if out_file is None else out_file)
         save_result(data, out_file)
-        error_df.to_csv(out_file.parent / "error.csv")
-        logger.info(f"Feature extraction complete!")
+        if not total_error_df.empty:
+            total_error_df.to_csv(out_file.parent / "error.csv")
+        
+        logger.info("Feature extraction complete!")
         if report is not None:
             report['msg'] = 'Finished'
             progress_q.put(report)
         log_listener.stop()
         return data
+
     except KeyboardInterrupt:
         logger.info("User aborted feature extraction!")
-        pool.terminate()
-        pool.join()
+        if pool:
+            pool.terminate()
+            pool.join()
         logger.info("Removing temporary files.")
         remove_tmp_folder(tmp_dir)
         if report is not None:
@@ -504,12 +534,12 @@ def run_dataset(
         log_listener.stop()
     except Exception:
         logger.exception("An Error Occured:")
-        pool.terminate()
-        pool.join()
+        if pool:
+            pool.terminate()
+            pool.join()
         logger.info("Removing temporary files.")
         remove_tmp_folder(tmp_dir)
         if report is not None:
             report['msg'] = 'Error'
             progress_q.put(report)
         log_listener.stop()
-
