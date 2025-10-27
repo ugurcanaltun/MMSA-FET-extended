@@ -8,6 +8,7 @@ import time
 from functools import wraps
 from multiprocessing import Queue
 from pathlib import Path
+import gc
 
 import numpy as np
 import pandas as pd
@@ -208,6 +209,49 @@ def extract_align(align_result, word_ids, feature_A, feature_V):
     aligned_feature_V = np.asarray(aligned_feature_V)
     return aligned_feature_A, aligned_feature_V
 
+
+def write_batch_to_disk(batch_data, mode, temp_files_dir, batch_idx):
+    """Write a batch of results to a temporary pickle file"""
+    batch_file = temp_files_dir / f"{mode}_batch_{batch_idx}.pkl"
+    with open(batch_file, 'wb') as f:
+        pickle.dump(batch_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    return batch_file
+
+def load_and_concat_batches(mode, temp_files_dir, logger):
+    """Load all batch files for a given mode and concatenate them into a single dictionary"""
+    batch_files = sorted(temp_files_dir.glob(f"{mode}_batch_*.pkl"))
+    
+    if not batch_files:
+        logger.warning(f"No batch files found for mode '{mode}' in '{temp_files_dir}'")
+        return {}
+    
+    logger.info(f"Loading {len(batch_files)} batch files for mode '{mode}'...")
+    
+    # Initialize the data structure by loading the first batch
+    with open(batch_files[0], 'rb') as f:
+        data_split = pickle.load(f)
+        
+    # Concatanate remaining batches
+    for batch_file in batch_files[1:]:
+        with open(batch_file, 'rb') as f:
+            batch_data = pickle.load(f)
+        for key in data_split.keys():
+            if key in batch_data:
+                data_split[key].extend(batch_data[key])
+            else:
+                logger.warning(f"Key '{key}' not found in batch file '{batch_file}'")
+        
+        # Delete the batch file to free disk space
+        batch_file.unlink()
+        del batch_data  # Free memory
+        gc.collect()
+    
+    batch_files[0].unlink()  # Delete the first batch file
+    gc.collect()
+    
+    return data_split
+    
+    
 def read_label_file(dataset_name, dataset_root_dir, dataset_dir):
     # Locate and read label.csv file
     assert dataset_name is not None or dataset_dir is not None, "Either 'dataset_name' or 'dataset_dir' must be specified."
@@ -313,7 +357,8 @@ def run_dataset(
     log_dir : Path | str = Path.home() / '.MMSA-FET/log',
     log_level : int = logging.INFO,
     progress_q : Queue = None, 
-    task_id : int = None
+    task_id : int = None,
+    batch_size : int = 100,
 ) -> dict:
     """
     Extract features from dataset and save in MMSA compatible format.
@@ -339,6 +384,10 @@ def run_dataset(
     # TODO: Batch processing to accelerate GPU models
     # TODO: add database operation for M-SENA
     Path(tmp_dir).mkdir(parents=True, exist_ok=True)
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    
+    temp_files_dir = tmp_dir / 'batch_files'
+    temp_files_dir.mkdir(parents=True, exist_ok=True)
     Path(log_dir).mkdir(parents=True, exist_ok=True)
 
     mp_ctx = multiprocessing.get_context('spawn')
@@ -368,13 +417,13 @@ def run_dataset(
         
         logger.info(f"Extracting features from '{dataset_name}' dataset.")
         logger.info(f"Dataset directory: '{dataset_dir}'")
-
+    
         # Split the DataFrame by mode ('train', 'valid', 'test') before processing
         modes = ['train', 'valid', 'test']
         df_splits = {mode: label_df[label_df['mode'] == mode].copy() for mode in modes}
 
         report = None
-        if isinstance(progress_q, Queue) and task_id is not None:
+        if progress_q is not None and task_id is not None:
             report = {'task_id': task_id, 'msg': 'Preparing', 'processed': 0, 'total': len(label_df)}
             progress_q.put(report)
 
@@ -407,8 +456,8 @@ def run_dataset(
                 initargs=init_args
             )
 
-            # This dictionary holds data for the current split only
-            data_split = {
+            # This dictionary holds data for a batch
+            batch_data = {
             "id": [], 
             "audio": [],
             "vision": [],
@@ -427,26 +476,62 @@ def run_dataset(
             "mode": []
             }
             error_df_split = pd.DataFrame()
+            batch_idx = 0
             
             if report is not None:
                 report['msg'] = f'Processing {mode} split'
                 progress_q.put(report)
 
             pbar_desc = f"Processing '{mode}' split"
-            for result in (pbar := tqdm(pool.imap_unordered(extract_one, df_split.iterrows(), chunksize=5), total=len(df_split), desc=pbar_desc)):
+            for idx, result in enumerate(pbar := tqdm(pool.imap_unordered(extract_one, df_split.iterrows(), chunksize=5), total=len(df_split), desc=pbar_desc)):
                 if isinstance(result, pd.Series):
                     error_df_split = pd.concat([error_df_split, result.to_frame().T])
                     continue
                 for k, v in result.items():
-                    data_split[k].append(v)
+                    batch_data[k].append(v)
+                if (idx + 1) % batch_size == 0:
+                    logger.info(f"Writing batch {batch_idx} to disk ({batch_size} samples)...")
+                    write_batch_to_disk(batch_data, mode, temp_files_dir, batch_idx)
+                    batch_idx += 1
+                    
+                    # Clear the batch from memory
+                    batch_data = {
+                        "id": [], 
+                        "audio": [],
+                        "vision": [],
+                        "raw_text": [],
+                        "text": [],
+                        "text_bert": [],
+                        "audio_lengths": [],
+                        "vision_lengths": [],
+                        "annotations": [],
+                        "regression_labels": [],
+                        'regression_labels_A': [],
+                        'regression_labels_V': [],
+                        'regression_labels_T': [],
+                        'align': [],
+                        "mode": []
+                    }
+                    gc.collect()  # Force garbage collection                    
                 if report is not None:
                     report['processed'] = global_processed_count + pbar.n
                     progress_q.put(report)
+                    
+            if len(batch_data['id']) > 0:
+                logger.info(f"Writing final batch {batch_idx} to disk ({len(batch_data['id'])} samples)...")
+                write_batch_to_disk(batch_data, mode, temp_files_dir, batch_idx)
+                del batch_data
+                gc.collect()
             
             pool.close()
             pool.join()
+            pool = None
             global_processed_count += len(df_split)
             total_error_df = pd.concat([total_error_df, error_df_split])
+            
+            # Load all batches from disk and concatenate
+            logger.info(f"Loading and concatenating batches for '{mode}' split...")
+            data_split = load_and_concat_batches(mode, temp_files_dir, logger)
 
             # Perform the "finalizing" steps on this split's data
             logger.info(f"Finalizing '{mode}' split...")
@@ -488,12 +573,29 @@ def run_dataset(
                         data_split[key] = np.array(value)
                     except ValueError:
                         data_split[key] = np.array(value, dtype=object)
+                        
+            # Save the processed split directly to disk as pickle
+            split_file = temp_files_dir / f"{mode}_processed.pkl"
+            logger.info(f"Saving processed '{mode}' split to disk...")
+            with open(split_file, 'wb') as f:
+                pickle.dump(data_split, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-            final_data[mode] = data_split
+            # Store only the filename reference, not the data
+            final_data[mode] = split_file
+            
             del data_split # Explicitly free memory
+            gc.collect()
 
-        # Combine results into the final structure
-        data = final_data
+        # Load all processed splits and combine
+        logger.info("Loading all processed splits from disk...")
+        data = {}
+        for mode, split_file in final_data.items():
+            logger.info(f"Loading '{mode}' split...")
+            with open(split_file, 'rb') as f:
+                data[mode] = pickle.load(f)
+            # Delete the temporary file
+            split_file.unlink()
+        
         data['config'] = config
         
         if report is not None:
@@ -513,6 +615,9 @@ def run_dataset(
         save_result(data, out_file)
         if not total_error_df.empty:
             total_error_df.to_csv(out_file.parent / "error.csv")
+            
+        # Clean up temporary batch files directory
+        shutil.rmtree(temp_files_dir)
         
         logger.info("Feature extraction complete!")
         if report is not None:
